@@ -1,0 +1,212 @@
+# ==============================================================================
+# 1. VISÃO GERAL E IMPORTAÇÃO DE BIBLIOTECAS (CLOUD-READY)
+# ==============================================================================
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+
+# Garantia de reprodutibilidade e formatação limpa para relatórios executivos
+np.random.seed(42)
+pd.set_option('display.float_format', lambda x: f'{x:,.2f}')
+print('Ambiente e bibliotecas configurados com sucesso para Cloud!')
+
+# ==============================================================================
+# 2. CARREGAMENTO E ENGENHARIA DE RECURSOS (FEATURE ENGINEERING)
+# ==============================================================================
+try:
+    df = pd.read_csv('dados_precificacao_dinamica_oficial.csv')
+except FileNotFoundError:
+    try:
+        df = pd.read_csv('dados_precificacao_dinamica.csv')
+    except FileNotFoundError:
+        df = pd.read_csv('dados_precificacao.csv')
+
+print(f'Total de Linhas Carregadas na Nuvem: {len(df)}')
+
+# Tratamento preventivo para garantir a coluna 'data' e 'periodo_mes' se não existirem
+if 'data' not in df.columns:
+    df['data'] = pd.date_range(start='2023-01-01', periods=len(df), freq='D')
+if 'periodo_mes' not in df.columns:
+    df['periodo_mes'] = df['mes'].astype(str)
+if 'historico_vendas_30d' not in df.columns:
+    df['historico_vendas_30d'] = df['historico_vendas_7d'] * 4.2  # Estimativa aproximada proxy
+
+# 1. Razão e Diferença Relativa de Preço
+df['razao_preco'] = df['preco_praticado'] / df['preco_concorrente']
+df['gap_preco_relativo'] = (df['preco_praticado'] - df['preco_concorrente']) / df['preco_concorrente']
+
+# 2. Pressão de Estoque
+df['cobertura_estoque_dias'] = df['estoque'] / (df['historico_vendas_7d'] + 1e-5)
+
+# 3. Tendência e Aceleração de Demanda
+df['tendencia_vendas'] = df['historico_vendas_7d'] / (df['historico_vendas_30d'] + 1e-5)
+
+# 4. Codificação Cíclica da Sazonalidade (Mês e Dia da Semana)
+df['mes_sin'] = np.sin(2 * np.pi * df['mes'] / 12.0)
+df['mes_cos'] = np.cos(2 * np.pi * df['mes'] / 12.0)
+df['dia_semana_sin'] = np.sin(2 * np.pi * df['dia_da_semana'] / 7.0)
+df['dia_semana_cos'] = np.cos(2 * np.pi * df['dia_da_semana'] / 7.0)
+
+# 5. Flag de Fim de Semana
+df['eh_fim_semana'] = df['dia_da_semana'].isin([5, 6]).astype(int)
+
+print(" Engenharia de Recursos concluída com sucesso!")
+
+# ==============================================================================
+# 3. TREINAMENTO E OTIMIZAÇÃO COM GRIDSEARCHCV (ANTI-LEAKAGE TEMPORAL)
+# ==============================================================================
+features_num = [
+    'preco_praticado', 'preco_concorrente', 'razao_preco', 'gap_preco_relativo',
+    'cobertura_estoque_dias', 'tendencia_vendas', 'historico_vendas_7d',
+    'historico_vendas_30d', 'estoque', 'mes_sin', 'mes_cos',
+    'dia_semana_sin', 'dia_semana_cos', 'eh_fim_semana'
+]
+features_cat = ['periodo_mes']
+target = 'demanda'
+
+preprocessor = ColumnTransformer([
+    ('num', StandardScaler(), features_num),
+    ('cat', OneHotEncoder(handle_unknown='ignore'), features_cat)
+])
+
+modelos = {}
+tabela_metricas = []
+
+for prod in df['produto'].unique():
+    print(f'
+Otimizando modelos para: {prod}...')
+    df_p = df[df['produto'] == prod].sort_values(by='data').reset_index(drop=True)
+    
+    X = df_p[features_num + features_cat]
+    y = df_p[target].values
+    
+    # Split temporal estratégico para evitar vazamento de dados (Anti-Leakage)
+    split_idx = int(len(df_p) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    
+    # A) Regressão Linear Baseline
+    pipe_lr = Pipeline([('prep', preprocessor), ('reg', LinearRegression())])
+    pipe_lr.fit(X_train, y_train)
+    pred_lr = np.clip(pipe_lr.predict(X_test), 0, None)
+    
+    # B) Rede Neural MLP com GridSearchCV (Parametrizada para Cloud)
+    param_grid = {
+        'mlp__hidden_layer_sizes': [(64, 32), (128, 64)],
+        'mlp__alpha': [0.0001, 0.001],
+        'mlp__learning_rate_init': [0.005]
+    }
+    pipe_mlp_base = Pipeline([
+        ('prep', preprocessor),
+        ('mlp', MLPRegressor(activation='relu', solver='adam', max_iter=3000, early_stopping=True, random_state=42))
+    ])
+    
+    # n_jobs=-1 garante o uso de todos os núcleos da sua máquina virtual na nuvem
+    grid_search = GridSearchCV(
+        pipe_mlp_base, param_grid, 
+        cv=KFold(n_splits=4, shuffle=True, random_state=42), 
+        scoring='neg_root_mean_squared_error', n_jobs=-1
+    )
+    grid_search.fit(X_train, y_train)
+    
+    # CORREÇÃO DO BUG 1: alterado de best_estimator__ para best_estimator_
+    best_mlp = grid_search.best_estimator_
+    pred_mlp = np.clip(best_mlp.predict(X_test), 0, None)
+    
+    # Métricas Técnicas Consolidadas
+    tabela_metricas.append({
+        'Produto': prod,
+        'R² (Linear)': r2_score(y_test, pred_lr),
+        'R² (Rede Neural)': r2_score(y_test, pred_mlp),
+        'MAE (Linear)': mean_absolute_error(y_test, pred_lr),
+        'MAE (Rede Neural)': mean_absolute_error(y_test, pred_mlp),
+        'RMSE (Linear)': np.sqrt(mean_squared_error(y_test, pred_lr)),
+        'RMSE (Rede Neural)': np.sqrt(mean_squared_error(y_test, pred_mlp)),
+        'MAPE % (Linear)': mean_absolute_percentage_error(y_test + 1e-5, pred_lr) * 100,
+        'MAPE % (Rede Neural)': mean_absolute_percentage_error(y_test + 1e-5, pred_mlp) * 100
+    })
+    
+    modelos[prod] = {
+        'lr': pipe_lr, 'mlp': best_mlp, 'df_p': df_p, 'X_train': X_train, 
+        'features_num': features_num, 'features_cat': features_cat
+    }
+
+df_metricas_finais = pd.DataFrame(tabela_metricas)
+print("
+" + "="*80 + "
+📈 TABELA DE MÉTRICAS TÉCNICAS FINAIS
+" + "="*80)
+print(df_metricas_finais.to_string(index=False))
+
+# ==============================================================================
+# 4. IMPACTO NO NEGÓCIO: MAXIMIZAÇÃO DE RECEITA ANUAL NO PERÍODO DE TESTE
+# ==============================================================================
+tabela_negocio = []
+
+for prod, res in modelos.items():
+    df_test = res['df_p'].iloc[len(res['X_train']):].copy().reset_index(drop=True)
+    modelo_mlp = res['mlp']
+    modelo_lr = res['lr']
+    
+    receita_historica = (df_test['preco_praticado'] * df_test['demanda']).sum()
+    receita_otimizada_lr = 0.0
+    receita_otimizada_mlp = 0.0
+    
+    # Simulação da busca de preço ótimo em grade (Grid Search)
+    for idx, row in df_test.iterrows():
+        preco_conc = row['preco_concorrente']
+        # Grade de simulação: testa variações de -20% a +20% em relação ao concorrente
+        precos_candidatos = np.linspace(preco_conc * 0.80, preco_conc * 1.20, 41)
+        
+        # Criação de cenários hipotéticos de teste para a IA avaliar
+        cenarios = pd.DataFrame([row[features_num + features_cat]] * len(precos_candidatos))
+        cenarios['preco_praticado'] = precos_candidatos
+        cenarios['razao_preco'] = precos_candidatos / preco_conc
+        cenarios['gap_preco_relativo'] = (precos_candidatos - preco_conc) / preco_conc
+        
+        # Previsão de demanda para cada preço candidato
+        demandas_pred_lr = np.clip(modelo_lr.predict(cenarios), 0, None)
+        demandas_pred_mlp = np.clip(modelo_mlp.predict(cenarios), 0, None)
+        
+        # Cálculo de receita esperada (Preço x Demanda Estimada)
+        receitas_lr = precos_candidatos * demandas_pred_lr
+        receitas_mlp = precos_candidatos * demandas_pred_mlp
+        
+        # Escolha do preço que gera a maior receita esperada
+        preco_otimo_lr = precos_candidatos[np.argmax(receitas_lr)]
+        preco_otimo_mlp = precos_candidatos[np.argmax(receitas_mlp)]
+        
+        # Como o ambiente é real/teste, avaliamos o impacto usando a demanda real observada proporcionalmente
+        fator_demanda_real = row['demanda'] / (row['historico_vendas_7d'] / 7.0 + 1e-5)
+        
+        demanda_real_lr = demandas_pred_lr[np.argmax(receitas_lr)] * fator_demanda_real
+        demanda_real_mlp = demandas_pred_mlp[np.argmax(receitas_mlp)] * fator_demanda_real
+        
+        receita_otimizada_lr += preco_otimo_lr * demanda_real_lr
+        # CORREÇÃO DO BUG 2: alterado de demande_real_mlp para demanda_real_mlp
+        receita_otimizada_mlp += preco_otimo_mlp * demanda_real_mlp
+        
+    tabela_negocio.append({
+        'Produto': prod,
+        'Receita Histórica (R$)': receita_historica,
+        'Receita Otimizada Reg. Linear (R$)': receita_otimizada_lr,
+        'Receita Otimizada Rede Neural (R$)': receita_otimizada_mlp,
+        'Ganho Incremental IA (R$)': receita_otimizada_mlp - receita_historica,
+        'Aumento Percentual IA (%)': ((receita_otimizada_mlp - receita_historica) / receita_historica) * 100
+    })
+
+df_negocio_final = pd.DataFrame(tabela_negocio)
+print("
+" + "="*80 + "
+📈 RELATÓRIO EXECUTIVO DE MAXIMIZAÇÃO DE RECEITA ANUAL
+" + "="*80)
+print(df_negocio_final.to_string(index=False))
